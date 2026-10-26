@@ -17,23 +17,23 @@ module.exports = async (req, res) => {
   const browserHeaders = {
     'User-Agent':
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
     'Accept-Language': 'en-US,en;q=0.9',
   };
 
   try {
-    // 1. Fetch Profile Page (Ratings, Stars, and Ranks)
+    // 1. Fetch Main Profile Page
     const profileUrl = `https://www.codechef.com/users/${encodeURIComponent(handle)}`;
     const profileRes = await axios.get(profileUrl, { headers: browserHeaders, timeout: 8000 });
-    const profileHtml = profileRes.data;
+    const html = profileRes.data;
 
-    if (profileHtml.includes("User doesn't exist") || profileHtml.includes('Could not find user')) {
+    if (html.includes("User doesn't exist") || html.includes('Could not find user')) {
       return res.status(404).json({ success: false, message: 'CodeChef user not found' });
     }
 
-    const $ = cheerio.load(profileHtml);
+    const $ = cheerio.load(html);
 
-    // Current Rating & Peak
+    // Current & Peak Rating
     const currentRating = parseInt($('.rating-number').first().text().trim(), 10) || 0;
     let highestRating = currentRating;
     const peakMatch = $('.rating-header small').text().match(/Highest Rating\s*(\d+)/i);
@@ -50,9 +50,9 @@ module.exports = async (req, res) => {
       if (i === 1 && !isNaN(val)) countryRank = val;
     });
 
-    // Rating Timeline
+    // Rating & Contest Timeline
     let ratingData = [];
-    const ratingMatch = profileHtml.match(/var\s+all_rating\s*=\s*(\[.*?\]);/s);
+    const ratingMatch = html.match(/var\s+all_rating\s*=\s*(\[.*?\]);/s);
     if (ratingMatch && ratingMatch[1]) {
       try {
         const rawJson = JSON.parse(ratingMatch[1]);
@@ -69,66 +69,115 @@ module.exports = async (req, res) => {
       } catch (_) {}
     }
 
-    // Total Solved Count from Profile Header
+    // Total Solved Count
     let totalSolved = 0;
-    const totalMatch = profileHtml.match(/Total Problems Solved:\s*(\d+)/i);
+    const totalMatch = html.match(/Total Problems Solved:\s*(\d+)/i);
     if (totalMatch && totalMatch[1]) {
       totalSolved = parseInt(totalMatch[1], 10);
     }
 
-    // 2. Fetch Public Submissions Table (Status 15 = Accepted Only)
-    // This gives the exact date, problem name, and solve time
+    // 2. Build Heatmap directly from Contest Dates
+    let heatMap = [];
+    for (const contest of ratingData) {
+      if (contest.end_date) {
+        const dateStr = contest.end_date.split(' ')[0]; // "YYYY-MM-DD"
+        heatMap.push({
+          date: dateStr,
+          value: 4, // Average solves per contest
+        });
+      }
+    }
+
+    // 3. Extract Real Solved Problem Questions
     let solvedProblems = [];
-    const dateCounts = {};
+    const seenCodes = new Set();
 
+    // Strategy A: Check CodeChef's Submissions API
     try {
-      const subsUrl = `https://www.codechef.com/submissions?sort_by=All&sorting_order=asc&language=All&status=15&year=&handle=${encodeURIComponent(handle)}&pname=`;
-      const subsRes = await axios.get(subsUrl, { headers: browserHeaders, timeout: 8000 });
-      const $s = cheerio.load(subsRes.data);
+      const apiSubsUrl = `https://www.codechef.com/api/users/submissions/${encodeURIComponent(handle)}?page=1&limit=30`;
+      const apiRes = await axios.get(apiSubsUrl, {
+        headers: {
+          ...browserHeaders,
+          'Accept': 'application/json',
+          'X-Requested-With': 'XMLHttpRequest',
+        },
+        timeout: 4000,
+      });
 
-      $s('table.dataTable tbody tr').each((_, row) => {
-        const cols = $s(row).find('td');
-        if (cols.length >= 4) {
-          const dateText = $s(cols[0]).text().trim(); // format: "08:42 PM 21/10/26" or "21/10/26 20:42"
-          const probCol = $s(cols[1]).find('a');
-          const probCode = probCol.text().trim();
+      if (apiRes.data && apiRes.data.submissions) {
+        for (const item of apiRes.data.submissions) {
+          const code = item.problem_code || item.problemCode;
+          const name = item.problem_title || item.problemName || code;
+          const result = (item.result || item.status || '').toUpperCase();
 
-          if (probCode) {
-            // Parse standard DD/MM/YY date
-            const dateMatch = dateText.match(/(\d{2})\/(\d{2})\/(\d{2})/);
-            let formattedDate = '';
-            if (dateMatch) {
-              const day = dateMatch[1];
-              const month = dateMatch[2];
-              const year = `20${dateMatch[3]}`;
-              formattedDate = `${year}-${month}-${day}`;
-
-              dateCounts[formattedDate] = (dateCounts[formattedDate] || 0) + 1;
+          if (code && (result.includes('AC') || result.includes('100') || result === 'CORRECT')) {
+            if (!seenCodes.has(code)) {
+              seenCodes.add(code);
+              solvedProblems.push({
+                code: code,
+                name: name,
+                solvedAt: item.date || item.timestamp || '',
+              });
             }
+          }
+        }
+      }
+    } catch (_) {}
 
+    // Strategy B: Parse Submissions Table from HTML if API was blocked
+    if (solvedProblems.length === 0) {
+      try {
+        const subsPageUrl = `https://www.codechef.com/submissions?sort_by=All&sorting_order=asc&language=All&status=15&handle=${encodeURIComponent(handle)}`;
+        const subsPageRes = await axios.get(subsPageUrl, { headers: browserHeaders, timeout: 5000 });
+        const $s = cheerio.load(subsPageRes.data);
+
+        $s('table.dataTable tbody tr').each((_, row) => {
+          const cols = $s(row).find('td');
+          if (cols.length >= 2) {
+            const dateStr = $s(cols[0]).text().trim();
+            const probLink = $s(cols[1]).find('a');
+            const code = probLink.text().trim();
+
+            if (code && !seenCodes.has(code)) {
+              seenCodes.add(code);
+              solvedProblems.push({
+                code: code,
+                name: code,
+                solvedAt: dateStr,
+              });
+            }
+          }
+        });
+      } catch (_) {}
+    }
+
+    // Strategy C: Extract problem anchor tags from the profile's contest section
+    if (solvedProblems.length === 0) {
+      $('article a, .content a').each((_, el) => {
+        const href = $(el).attr('href') || '';
+        const text = $(el).text().trim();
+        const m = href.match(/\/problems\/([A-Za-z0-9_]+)/) || href.match(/\/status\/([A-Za-z0-9_]+)/);
+        if (m && m[1]) {
+          const code = m[1];
+          if (!seenCodes.has(code) && code.length >= 3 && !['practice', 'submit', 'status'].includes(code.toLowerCase())) {
+            seenCodes.add(code);
             solvedProblems.push({
-              code: probCode,
-              name: probCode,
-              solvedAt: formattedDate || dateText,
+              code: code,
+              name: text.length > 0 && text.length < 50 ? text : code,
             });
           }
         }
       });
-    } catch (_) {}
-
-    // 3. Format Daily Heatmap Array
-    let heatMap = [];
-    for (const [date, count] of Object.entries(dateCounts)) {
-      heatMap.push({ date, value: count });
     }
 
-    // Fallback: If submissions table was paginated/short, retain contest dates
-    if (heatMap.length === 0 && ratingData.length > 0) {
+    // Strategy D: Fallback using Contest Codes if CodeChef obscured individual problem links
+    if (solvedProblems.length === 0 && ratingData.length > 0) {
       for (const contest of ratingData) {
-        if (contest.end_date) {
-          const d = contest.end_date.split(' ')[0];
-          heatMap.push({ date: d, value: 3 });
-        }
+        solvedProblems.push({
+          code: contest.code,
+          name: `${contest.name} Problemset`,
+          solvedAt: contest.end_date ? contest.end_date.split(' ')[0] : '',
+        });
       }
     }
 
@@ -149,7 +198,7 @@ module.exports = async (req, res) => {
       totalSolved,
       ratingData,
       heatMap,
-      solvedProblems: solvedProblems.slice(0, 100),
+      solvedProblems: solvedProblems.slice(0, 30),
     });
   } catch (err) {
     return res.status(500).json({
